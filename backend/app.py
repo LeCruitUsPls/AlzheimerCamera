@@ -84,66 +84,78 @@ def recognize_face():
             buffer = io.BytesIO()
             image.save(buffer, format='JPEG')
             image_bytes = buffer.getvalue()
-            print(f"Converted image size: {len(image_bytes)} bytes")
+            print(f"[RECOGNIZE] Converted image size: {len(image_bytes)} bytes")
         except Exception as e:
+            print(f"[RECOGNIZE] Image conversion failed: {e}")
             return jsonify({'error': f'Image conversion failed: {str(e)}'}), 400
         
         # Search for face in collection
-        response = rekognition.search_faces_by_image(
-            CollectionId=COLLECTION_ID,
-            Image={'Bytes': image_bytes},
-            MaxFaces=1,
-            FaceMatchThreshold=70
-        )
+        try:
+            print(f"[RECOGNIZE] Searching in collection: {COLLECTION_ID}")
+            response = rekognition.search_faces_by_image(
+                CollectionId=COLLECTION_ID,
+                Image={'Bytes': image_bytes},
+                MaxFaces=1,
+                FaceMatchThreshold=70
+            )
+            
+            print(f"[RECOGNIZE] Rekognition response: {len(response.get('FaceMatches', []))} matches found")
+            
+            if response['FaceMatches']:
+                match = response['FaceMatches'][0]
+                person_id = match['Face']['ExternalImageId']
+                confidence = match['Similarity']
+                print(f"[RECOGNIZE] Match found: person_id={person_id}, confidence={confidence}%")
+                
+                # Get person info from DynamoDB
+                db_response = table.get_item(Key={'person_id': person_id})
+                person_info = db_response.get('Item', {})
+                print(f"[RECOGNIZE] Person info: {person_info.get('name', 'Unknown')}")
+                
+                # Create structured announcement with name, role, and age
+                name = person_info.get('name', 'Unknown person')
+                relationship = person_info.get('relationship', 'Unknown role')
+                age = person_info.get('age', 'Unknown age')
+                
+                # Create announcement text
+                announcement = f"This is {name}, your {relationship}, age {age}."
+                print(f"[RECOGNIZE] Generated announcement: {announcement}")
+                
+                # Generate TTS audio using ElevenLabs
+                print(f"[TTS] Generating audio for person: {name}")
+                audio_base64 = generate_tts_audio(announcement)
+                print(f"[TTS] Audio generated: {bool(audio_base64)}, length: {len(audio_base64) if audio_base64 else 0}")
+                
+                result = {
+                    'matched': True,
+                    'person': {'name': name},
+                    'note': announcement,
+                    'notes': person_info.get('notes', ''),
+                    'confidence': confidence
+                }
+                
+                # Add audio if TTS was successful
+                if audio_base64:
+                    result['audio'] = audio_base64
+                
+                print(f"[RECOGNIZE] Returning result with audio: {bool(audio_base64)}")
+                return jsonify(result)
+            else:
+                print("[RECOGNIZE] No matches found")
+                return jsonify({
+                    'matched': False,
+                    'note': 'Person not recognized'
+                })
         
-        print(f"Rekognition response: {len(response.get('FaceMatches', []))} matches found")
-        
-        if response['FaceMatches']:
-            match = response['FaceMatches'][0]
-            person_id = match['Face']['ExternalImageId']
-            confidence = match['Similarity']
-            print(f"Match found: person_id={person_id}, confidence={confidence}%")
-            
-            # Get person info from DynamoDB
-            db_response = table.get_item(Key={'person_id': person_id})
-            person_info = db_response.get('Item', {})
-            print(f"Person info: {person_info.get('name', 'Unknown')}")
-            
-            # Create structured announcement with name, role, and age
-            name = person_info.get('name', 'Unknown person')
-            relationship = person_info.get('relationship', 'Unknown role')
-            age = person_info.get('age', 'Unknown age')
-            
-            # Create announcement text
-            announcement = f"This is {name}, your {relationship}, age {age}."
-            print(f"Generated announcement: {announcement}")
-            
-            # Generate TTS audio using ElevenLabs
-            print(f"[TTS] Generating audio for person: {name}")
-            audio_base64 = generate_tts_audio(announcement)
-            print(f"[TTS] Audio generated: {bool(audio_base64)}, length: {len(audio_base64) if audio_base64 else 0}")
-            
-            result = {
-                'matched': True,
-                'person': {'name': name},
-                'note': announcement,
-                'notes': person_info.get('notes', '')
-            }
-            
-            # Add audio if TTS was successful
-            if audio_base64:
-                result['audio'] = audio_base64
-            
-            print(f"Returning result with audio: {bool(audio_base64)}")
-            return jsonify(result)
-        else:
-            print("No matches found")
-            return jsonify({
-                'matched': False,
-                'note': 'Person not recognized'
-            })
+        except rekognition.exceptions.InvalidParameterException as e:
+            print(f"[RECOGNIZE] Invalid parameter: {e}")
+            return jsonify({'error': 'No face detected in image'}), 400
+        except Exception as rekognition_error:
+            print(f"[RECOGNIZE] Rekognition error: {rekognition_error}")
+            return jsonify({'error': f'Face recognition failed: {str(rekognition_error)}'}), 500
             
     except Exception as e:
+        print(f"[RECOGNIZE] General error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 def generate_bedrock_note(person_info):
@@ -408,9 +420,12 @@ def add_person():
 @app.route('/reminders', methods=['GET'])
 def get_reminders():
     """Get all people as reminders"""
+    print(f"[REMINDERS] Request from {request.remote_addr}")
     try:
+        print(f"[REMINDERS] Scanning table: {TABLE_NAME}")
         response = table.scan()
         people = response.get('Items', [])
+        print(f"[REMINDERS] Found {len(people)} people")
         
         reminders = []
         for person in people:
@@ -418,13 +433,16 @@ def get_reminders():
             image_url = None
             if person.get('s3_key'):
                 try:
+                    # Check if object exists first
+                    s3.head_object(Bucket=BUCKET_NAME, Key=person.get('s3_key'))
                     image_url = s3.generate_presigned_url(
                         'get_object',
                         Params={'Bucket': BUCKET_NAME, 'Key': person.get('s3_key')},
                         ExpiresIn=3600  # 1 hour
                     )
                 except Exception as e:
-                    print(f"Error generating presigned URL: {e}")
+                    print(f"[REMINDERS] Image not found for {person.get('name')}: {e}")
+                    image_url = None
             
             reminders.append({
                 'person_id': person.get('person_id'),
@@ -436,8 +454,10 @@ def get_reminders():
                 'image_url': image_url
             })
         
+        print(f"[REMINDERS] Returning {len(reminders)} reminders")
         return jsonify({'reminders': reminders})
     except Exception as e:
+        print(f"[REMINDERS] Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/person/<person_id>', methods=['GET'])

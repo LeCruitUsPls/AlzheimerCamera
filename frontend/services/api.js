@@ -1,5 +1,5 @@
 // Use your computer's IP address for mobile testing
-const API_BASE_URL = __DEV__ ? 'http://localhost:8000' : 'http://localhost:8000';
+const API_BASE_URL = __DEV__ ? 'http://172.20.10.2:8000' : 'http://localhost:8000';
 
 export const api = {
   // Recognize a person from image
