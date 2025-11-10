@@ -31,6 +31,17 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Add request logging
+@app.before_request
+def log_request_info():
+    print(f"[REQUEST] {request.method} {request.path} from {request.remote_addr}")
+    if request.is_json:
+        print(f"[REQUEST] Content-Type: {request.content_type}")
+        print(f"[REQUEST] JSON keys: {list(request.get_json().keys()) if request.get_json() else 'None'}")
+    else:
+        print(f"[REQUEST] Content-Type: {request.content_type}")
+        print(f"[REQUEST] Form data: {list(request.form.keys()) if request.form else 'None'}")
+
 # AWS clients
 rekognition = boto3.client('rekognition')
 s3 = boto3.client('s3')
@@ -43,6 +54,7 @@ COLLECTION_ID = os.getenv('REKOGNITION_COLLECTION_ID', 'alzheimer-faces')
 TABLE_NAME = os.getenv('DYNAMODB_TABLE_NAME', 'alzheimer-persons')
 ELEVENLABS_API_KEY = os.getenv('ELEVEN_LAB_API_KEY')
 ELEVENLABS_VOICE_ID = os.getenv('VOICE_ID')
+TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
 
 # DynamoDB table
 table = dynamodb.Table(TABLE_NAME)
@@ -217,11 +229,18 @@ def add_person():
     print(f"[ADD_PERSON] Request received from {request.remote_addr}")
     try:
         data = request.get_json()
+        if not data:
+            print("[ADD_PERSON] No JSON data received")
+            return jsonify({'error': 'No data provided'}), 400
+            
         image_data = data.get('image')
         name = data.get('name')
         relationship = data.get('relationship')
         age = data.get('age')
         notes = data.get('notes', '')
+        
+        print(f"[ADD_PERSON] Received - name: '{name}', relationship: '{relationship}', age: {age}")
+        print(f"[ADD_PERSON] Image data length: {len(image_data) if image_data else 0}")
         
         if not image_data or not name or not relationship:
             print(f"Validation failed - image_data: {bool(image_data)}, name: '{name}', relationship: '{relationship}'")
@@ -229,44 +248,52 @@ def add_person():
         
         # Decode and convert image
         try:
+            print(f"[ADD_PERSON] Processing image data...")
             if ',' in image_data:
                 image_bytes = base64.b64decode(image_data.split(',')[1])
             else:
                 image_bytes = base64.b64decode(image_data)
             
+            print(f"[ADD_PERSON] Decoded image bytes: {len(image_bytes)}")
+            print(f"[ADD_PERSON] First 20 bytes: {image_bytes[:20]}")
+            
             # Try to open and convert image
             try:
                 # Check if it's a HEIC file and handle specially
-                if b'ftyp' in image_bytes[:20] and b'heic' in image_bytes[:20]:
-                    print("Detected HEIC image, using pillow_heif")
+                if len(image_bytes) > 20 and b'ftyp' in image_bytes[:20] and b'heic' in image_bytes[:20]:
+                    print("[ADD_PERSON] Detected HEIC image, using pillow_heif")
                     if HEIF_AVAILABLE:
                         try:
                             heif_file = pillow_heif.open_heif(io.BytesIO(image_bytes))
                             image = heif_file.to_pillow()
                         except Exception as heif_error:
-                            print(f"HEIF processing failed: {heif_error}")
+                            print(f"[ADD_PERSON] HEIF processing failed: {heif_error}")
                             return jsonify({'error': 'Failed to process HEIC image'}), 400
                     else:
                         return jsonify({'error': 'HEIC images not supported on this server'}), 400
                 else:
                     # Regular image processing
+                    print(f"[ADD_PERSON] Processing as regular image")
                     image = Image.open(io.BytesIO(image_bytes))
+                    print(f"[ADD_PERSON] Image opened successfully: {image.size}, mode: {image.mode}")
                 
                 # Convert to RGB if needed
                 if image.mode in ('RGBA', 'P', 'L'):
+                    print(f"[ADD_PERSON] Converting from {image.mode} to RGB")
                     image = image.convert('RGB')
                 
                 # Save as JPEG
                 buffer = io.BytesIO()
                 image.save(buffer, format='JPEG', quality=85)
                 image_bytes = buffer.getvalue()
-                print(f"Converted image size: {len(image_bytes)} bytes")
+                print(f"[ADD_PERSON] Converted image size: {len(image_bytes)} bytes")
             except Exception as img_error:
-                print(f"Image processing failed: {img_error}")
-                return jsonify({'error': 'Unsupported image format. Please use JPEG, PNG, or HEIC.'}), 400
+                print(f"[ADD_PERSON] Image processing failed: {img_error}")
+                print(f"[ADD_PERSON] Image error type: {type(img_error)}")
+                return jsonify({'error': f'Image processing failed: {str(img_error)}'}), 400
         except Exception as e:
-            print(f"Image processing error: {str(e)}")
-            return jsonify({'error': f'Image processing failed: {str(e)}'}), 400
+            print(f"[ADD_PERSON] Base64 decode error: {str(e)}")
+            return jsonify({'error': f'Image decode failed: {str(e)}'}), 400
         
         # Check if person already exists
         try:
@@ -317,48 +344,62 @@ def add_person():
         # Create new person
         person_id = str(uuid.uuid4())
         
-        # Add face to Rekognition collection
-        response = rekognition.index_faces(
-            CollectionId=COLLECTION_ID,
-            Image={'Bytes': image_bytes},
-            ExternalImageId=person_id,
-            MaxFaces=1
-        )
-        
-        if response['FaceRecords']:
-            face_id = response['FaceRecords'][0]['Face']['FaceId']
-            
-            # Store image in S3
-            s3_key = f"{person_id}/{face_id}.jpg"
-            s3.put_object(
-                Bucket=BUCKET_NAME,
-                Key=s3_key,
-                Body=image_bytes,
-                ContentType='image/jpeg'
-            )
-            
-            # Store person info in DynamoDB
-            table.put_item(
-                Item={
-                    'person_id': person_id,
-                    'name': name,
-                    'relationship': relationship,
-                    'age': age,
-                    'notes': notes,
-                    'face_id': face_id,
-                    's3_key': s3_key,
-                    'created_at': datetime.utcnow().isoformat()
-                }
-            )
-            
-            return jsonify({
-                'success': True,
-                'person_id': person_id,
-                'face_id': face_id,
-                'created': True
-            })
+        # Add face to Rekognition collection (or skip in test mode)
+        if TEST_MODE:
+            print("[TEST_MODE] Skipping Rekognition face detection")
+            face_id = str(uuid.uuid4())
         else:
-            return jsonify({'error': 'No face detected'}), 400
+            try:
+                response = rekognition.index_faces(
+                    CollectionId=COLLECTION_ID,
+                    Image={'Bytes': image_bytes},
+                    ExternalImageId=person_id,
+                    MaxFaces=1
+                )
+                
+                if not response['FaceRecords']:
+                    return jsonify({
+                        'error': 'No face detected in image. Please ensure:\n• The photo clearly shows a person\'s face\n• The face is well-lit and not blurry\n• The person is looking towards the camera',
+                        'code': 'NO_FACE_DETECTED'
+                    }), 400
+                    
+                face_id = response['FaceRecords'][0]['Face']['FaceId']
+            except Exception as rekognition_error:
+                print(f"[ADD_PERSON] Rekognition error: {rekognition_error}")
+                return jsonify({'error': f'Face detection failed: {str(rekognition_error)}'}), 500
+        
+        # Store image in S3
+        s3_key = f"{person_id}/{face_id}.jpg"
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=s3_key,
+            Body=image_bytes,
+            ContentType='image/jpeg'
+        )
+        print(f"[ADD_PERSON] Image stored in S3: {s3_key}")
+        
+        # Store person info in DynamoDB
+        table.put_item(
+            Item={
+                'person_id': person_id,
+                'name': name,
+                'relationship': relationship,
+                'age': age,
+                'notes': notes,
+                'face_id': face_id,
+                's3_key': s3_key,
+                'created_at': datetime.utcnow().isoformat()
+            }
+        )
+        print(f"[ADD_PERSON] Person stored in DynamoDB")
+        
+        return jsonify({
+            'success': True,
+            'person_id': person_id,
+            'face_id': face_id,
+            'created': True,
+            'message': f'Successfully added {name}!'
+        })
             
     except Exception as e:
         print(f"Add person error: {str(e)}")
@@ -684,6 +725,7 @@ def delete_person(person_id):
 
 @app.route('/health', methods=['GET'])
 def health():
+    print("[HEALTH] Health check requested")
     return jsonify({'status': 'healthy'})
 
 @app.route('/test-tts', methods=['GET'])

@@ -1,5 +1,5 @@
 // Use your computer's IP address for mobile testing
-const API_BASE_URL = __DEV__ ? 'http://172.17.204.88:8000' : 'http://localhost:8000';
+const API_BASE_URL = __DEV__ ? 'http://localhost:8000' : 'http://localhost:8000';
 
 export const api = {
   // Recognize a person from image
@@ -81,15 +81,15 @@ export const api = {
     return response.json();
   },
 
-  // Add images to person's gallery
-  async addPersonMedia(personId, images) {
+  // Add image to person's gallery
+  async addPersonMedia(personId, imageBase64) {
     const response = await fetch(`${API_BASE_URL}/person/${personId}/media`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        images: Array.isArray(images) ? images : [images]
+        image: imageBase64
       })
     });
     return response.json();
